@@ -33,15 +33,3 @@ def extract_keys_and_values(past_key_values):
     if len(keys) != len(values):
         raise ValueError("The key and value caches must contain the same number of layers")
     return keys, values
-
-def get_kv_cache_memory_mb(past_key_values):
-    """Tính dung lượng bộ nhớ của past_key_values gốc."""
-
-    keys, values = extract_keys_and_values(past_key_values)
-    total_bytes = 0
-
-    for k, v in zip(keys, values):
-        total_bytes += k.nelement() * k.element_size()
-        total_bytes += v.nelement() * v.element_size()
-
-    return total_bytes / (1024 * 1024)

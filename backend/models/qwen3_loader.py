@@ -1,42 +1,58 @@
 import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from pathlib import Path
+from dotenv import load_dotenv
+import json
 
+BASE_DIR = Path(__file__).resolve().parents[2]
+# Nạp file .env
+load_dotenv(BASE_DIR / ".env")
 # Đường dẫn mặc định trỏ đến thư mục chứa trọng số mô hình
-DEFAULT_MODEL_PATH = "D:\\KVCacheOptimizationLab\\weights\\Qwen3-8B"
+class Model_Qwen:
+    def __init__(self):
+        self.model_paths = json.loads(
+            os.getenv("MODEL_PATH", "{}")
+        )
+        self.current_name_version = None
+        self.current_model = None
+        self.current_tokenizer = None
 
-def load_qwen3_model_and_tokenizer(model_path: str = DEFAULT_MODEL_PATH):
-    """
-    Load mô hình Qwen3-8B và Tokenizer từ thư mục trọng số cục bộ chạy trên CPU.
-    """
-    print("path model = ", model_path)
+    def load_model(self,model_version : str = "qwen3-8b"):
+        """
+        Load mô hình Qwen3-8B và Tokenizer từ thư mục trọng số cục bộ chạy trên CPU.
+        """
+        # kiểm tra version hiện tại
+        if self.current_name_version == model_version:
+            return self.current_model , self.current_tokenizer
+        if model_version not in self.model_paths:
+            raise ValueError(
+                f"Không tìm thấy phiên bản {model_version}"
+            )
+        # xóa model hiện tại và xóa cache nếu có
+        del self.current_model
+        torch.cuda.empty_cache()
 
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Không tìm thấy thư mục trọng số tại: {model_path}")
+        model_path = self.model_paths[model_version]
 
-    print(f"[Loading] Loading Tokenizer from {model_path}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, 
-        trust_remote_code=True
-    )
+        print(f"Loading model qwen version {model_version} ở đường dẫn: {model_path}")
+        self.current_tokenizer = AutoTokenizer.from_pretrained(
+            model_path, 
+            trust_remote_code=True
+        )
 
-    print(f"[Loading] Loading Qwen3 Model onto CPU (float16)...")
-    # Sử dụng torch.float16 để tiết kiệm 50% RAM CPU so với float32
-    # low_cpu_mem_usage=True giúp giảm RAM ảo khi đang load safetensors
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        trust_remote_code=True
-    )
+        print(f"[Loading] Loading Qwen3 Model onto CPU (float16)...")
+        # Sử dụng torch.float16 để tiết kiệm 50% RAM CPU so với float32
+        # low_cpu_mem_usage=True giúp giảm RAM ảo khi đang load safetensors
+        self.current_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map=os.getenv("DEVICE"),
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
+        )
 
-    model.eval()  # Đưa model về chế độ evaluation (tắt dropout/batchnorm)
-    print("[Success] Model and Tokenizer loaded successfully!")
-    
-    return model, tokenizer
-
-if __name__ == "__main__":
-    # Test chạy thử độc lập hàm load
-    model, tokenizer = load_qwen3_model_and_tokenizer()
-    print(f"Model Architecture: {model.__class__.__name__}")
+        self.current_model.eval()  # Đưa model về chế độ evaluation (tắt dropout/batchnorm)
+        print("[Success] Model and Tokenizer loaded successfully!")
+        
+        return self.current_model, self.current_tokenizer

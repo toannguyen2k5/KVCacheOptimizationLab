@@ -1,7 +1,8 @@
 import torch
 from kv_cache.utils import extract_keys_and_values
+from transformers.cache_utils import DynamicCache
 import numpy as np
-
+from optimizers.base import BaseOptimizer
 # TODO : test lại hàm tính CKA theo cách tác giả, hiện tại đang dùng hàm tính CKA chuẩn (linear CKA) để tính tỉ lệ đồng dạng giữa các layer liên tiếp
 # đây là hàm tinh CKA theo cách tác giả, tính riêng cho từng head và batch --> không nén token --> tính tỉ lệ đồng dạng cka giưa các layer liên tiếp
 def compute_author_cka(X, Y, eps=1e-12):
@@ -75,29 +76,6 @@ def compute_author_cka(X, Y, eps=1e-12):
 
     return cka_per_head, cka_mean.item()
 
-
-def compute_liner_cka(X,Y):
-    """
-         tính linear CKA giữa 2 tensor [seq_len,hidden_dim]
-         cần flatten các chiều batch và head về 2D trước khi tính CKA    
-    """
-    # flatten các chiều batch và head về 2D
-    X_flat = X.reshape(-1, X.shape[-1]).to(torch.float32)
-    Y_flat = Y.reshape(-1, Y.shape[-1]).to(torch.float32)
-
-    # center dữ liệu (trừ đi mean)
-    X_centered = X_flat - X_flat.mean(dim=0)
-    Y_centered = Y_flat - Y_flat.mean(dim=0)
-
-    # tính CKA
-    dot_prod = torch.norm(torch.matmul(X_centered.T, Y_centered), p='fro') ** 2
-    norm_X = torch.norm(torch.matmul(X_centered.T, X_centered), p='fro')
-    norm_Y = torch.norm(torch.matmul(Y_centered.T, Y_centered), p='fro')
-
-    if norm_X == 0 or norm_Y == 0:
-        return 0.0
-    return (dot_prod / (norm_X * norm_Y)).item()
-
 def to_2d(tensor):
     """
         Chuyển tensor 4D [B, H, S, D] thành 2D [B*H*S, D]
@@ -110,7 +88,7 @@ def from_2d(m,H,D):
     """[S,H*D] --> [1 ,H ,S ,D]"""
     return m.reshape(m.shape[0],H,D).permute(1,0,2).unsqueeze(0)
 
-class XKVOptimizer:
+class XKVOptimizer(BaseOptimizer):
     def __init__(self, rank_ratio_k =0.09 , rank_ratio_v = 0.14 ,window_size = 4 , grouping = "window", cka_threshold = 0.85 ):
         """
         rank_ratio_*: r / (G*d). Khi S lớn, tỉ lệ nén ≈ 1/rank_ratio.
@@ -124,27 +102,37 @@ class XKVOptimizer:
         self.grouping = grouping
         self.cka_threshold = cka_threshold
 
-    def _make_groups(self,keys,values):
+    def _make_groups(self, keys, values):
         n = len(keys)
+
         if self.grouping == "window":
-            return [list(range(s,min(s+self.W,n))) for s in range(0,n,self.W)]
+            return [
+                list(range(s, min(s + self.W, n)))
+                for s in range(0, n, self.W)
+            ]
 
-        k2d = [to_2d(k) for k in keys]
-        v2d = [to_2d(v) for v in values]
+        assigned = [False] * n
+        groups = []
 
-        assigned , groups = [False] * n , []
         for i in range(n):
-            if assigned[i] : continue
-            assigned[i] = True
-            g = [i]
-            for j in range(i+1,n):
-                if assigned[j] : continue
-                if compute_liner_cka(k2d[i],k2d[j]) >= self.cka_threshold and compute_liner_cka(v2d[i],v2d[j]) >= self.cka_threshold:
-                    g.append(j)
-                    assigned[j] = True
-            groups.append(g)
-        return groups 
+            if assigned[i]:
+                continue
 
+            assigned[i] = True
+            group = [i]
+
+            for j in range(i + 1, n):
+                if assigned[j]:
+                    continue
+                _, key_score = compute_author_cka(keys[i],keys[j])
+
+                _, value_score = compute_author_cka(values[i],values[j])
+
+                if (key_score >= self.cka_threshold and value_score >= self.cka_threshold):
+                    group.append(j)
+                    assigned[j] = True
+            groups.append(group)
+        return groups
     # ---------- phân rã chéo layer ----------
     @staticmethod
     def _factorize(mats , rank_raito):
@@ -162,6 +150,7 @@ class XKVOptimizer:
         keys, values = extract_keys_and_values(past_key_values)
         _, self.H, _, self.D = keys[0].shape
         self.num_layers = len(keys)
+
         self.layer_to_group = {}
         self.groups = []
         for gi, ids in enumerate(self._make_groups(keys, values)):
@@ -172,8 +161,6 @@ class XKVOptimizer:
                 self.layer_to_group[lid] = (gi, pos)
         return self.groups
 
-    compress_with_cka = compress   # giữ tên cũ cho main.py
-
     # ---------- khôi phục đúng 1 layer ----------
     def reconstruct_layer(self, layer_idx):
         gi, pos = self.layer_to_group[layer_idx]
@@ -181,7 +168,14 @@ class XKVOptimizer:
         k = g["Ak"].float() @ g["Bk"][pos].float()    # [S, r] @ [r, d] -> [S, d]
         v = g["Av"].float() @ g["Bv"][pos].float()
         return from_2d(k, self.H, self.D), from_2d(v, self.H, self.D)
-
+    
+    def reconstruct_cache(self,model):
+        optimized_past_kv = DynamicCache()
+        for i in range(self.num_layers):
+            k, v = self.reconstruct_layer(i)
+            optimized_past_kv.update(k.to(model.dtype), v.to(model.dtype), layer_idx=i)
+        return optimized_past_kv
+    
     def memory_mb(self):
         total = 0
         for g in self.groups:
@@ -189,4 +183,4 @@ class XKVOptimizer:
                 total += g[key].nelement() * g[key].element_size()
             for key in ("Bk", "Bv"):
                 total += sum(b.nelement() * b.element_size() for b in g[key])
-        return total / 1024 ** 2
+        return total / (1024 ** 2)
